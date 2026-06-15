@@ -1,6 +1,7 @@
 ﻿import express from "express";
 import path from "path";
 import fs from "fs";
+import * as net from "node:net";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -10,10 +11,82 @@ dotenv.config();
 
 const PROJECT_ROOT = process.cwd();
 const app = express();
-const PORT = Number(process.env.PORT || 3000);
+const REQUESTED_PORT = parsePort(process.env.PORT, 3000);
+const PORT_SCAN_LIMIT = parsePort(process.env.PORT_SCAN_LIMIT, 30);
 let latestGeneratedSprite: any = null;
 const GENERATED_DIR = path.join(PROJECT_ROOT, "public", "generated");
 const GAME_LIBRARY_PATH = path.join(GENERATED_DIR, "game_asset_library.json");
+
+function parsePort(value: string | undefined, fallback: number) {
+  const port = Number(value ?? fallback);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return fallback;
+  }
+  return port;
+}
+
+function canBindPort(port: number, host: string) {
+  return new Promise<boolean>((resolve) => {
+    const tester = net.createServer();
+    tester.once("error", (error: NodeJS.ErrnoException) => {
+      if (host.startsWith("::") && error.code !== "EADDRINUSE") {
+        resolve(true);
+        return;
+      }
+      resolve(false);
+    });
+    tester.once("listening", () => {
+      tester.close(() => resolve(true));
+    });
+    tester.listen(port, host);
+  });
+}
+
+async function isLocalPortAvailable(port: number) {
+  const availability = await Promise.all([
+    canBindPort(port, "127.0.0.1"),
+    canBindPort(port, "0.0.0.0"),
+    canBindPort(port, "::1"),
+    canBindPort(port, "::")
+  ]);
+  return availability.every(Boolean);
+}
+
+async function findAvailablePort(startPort: number, label: string) {
+  for (let port = startPort; port <= startPort + PORT_SCAN_LIMIT; port++) {
+    if (await isLocalPortAvailable(port)) {
+      if (port !== startPort) {
+        console.warn(`${label} port ${startPort} is in use; using ${port} instead.`);
+      }
+      return port;
+    }
+  }
+  throw new Error(`No available ${label} port found from ${startPort} to ${startPort + PORT_SCAN_LIMIT}.`);
+}
+
+function listenOnPort(port: number) {
+  return new Promise<void>((resolve, reject) => {
+    const server = app.listen(port);
+    server.once("listening", () => resolve());
+    server.once("error", (error: NodeJS.ErrnoException) => reject(error));
+  });
+}
+
+async function listenWithPortFallback(startPort: number) {
+  for (let port = startPort; port <= startPort + PORT_SCAN_LIMIT; port++) {
+    try {
+      await listenOnPort(port);
+      return port;
+    } catch (error) {
+      const listenError = error as NodeJS.ErrnoException;
+      if (listenError.code !== "EADDRINUSE") {
+        throw error;
+      }
+      console.warn(`app port ${port} became unavailable during startup; trying ${port + 1}.`);
+    }
+  }
+  throw new Error(`No available app port found from ${startPort} to ${startPort + PORT_SCAN_LIMIT}.`);
+}
 
 // Increase payload limits for base64 reference images
 app.use(express.json({ limit: "50mb" }));
@@ -777,13 +850,21 @@ app.post("/api/spritesheet/generate", async (req, res) => {
 });
 // Configure Vite middleware or production build output
 async function startServer() {
+  const port = await findAvailablePort(REQUESTED_PORT, "app");
+
   if (process.env.NODE_ENV !== "production") {
+    const hmrPort = await findAvailablePort(Math.max(24678, port + 1), "vite hmr");
+
     // Development mode
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        hmr: { port: hmrPort },
+        middlewareMode: true
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
+    console.log(`Vite HMR is running on ws://localhost:${hmrPort}`);
   } else {
     // Production mode
     const distPath = path.join(process.cwd(), "dist");
@@ -793,9 +874,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
-  });
+  const activePort = await listenWithPortFallback(port);
+  console.log(`Server is running on http://localhost:${activePort}`);
 }
 
 startServer();
